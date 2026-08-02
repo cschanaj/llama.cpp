@@ -122,13 +122,10 @@ llama_model_gemma_embedding::graph::graph(const llama_model & model, const llm_g
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            // ref: https://github.com/google/gemma_pytorch/blob/014acb7ac4563a5f77c76d7ff98f31b568c16508/gemma/model.py#L315
-            Qcur = ggml_scale(ctx0, Qcur, hparams.f_attention_scale);
-
             cur =
                 build_attn(inp_attn,
                     model.layers[il].wo, NULL, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
