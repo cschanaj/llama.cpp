@@ -263,10 +263,14 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         // feed-forward network
         const bool is_moe_layer = model.layers[il].ffn_gate_inp != nullptr;
         if (is_moe_layer) {
+            // attn_out feeds the shared expert, the routed experts, and the
+            // router below. rms_norm depends only on attn_out and eps, so do it
+            // once and reuse (ggml does not eliminate common subexpressions).
+            ggml_tensor * attn_out_n = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
+            cb(attn_out_n, "attn_out_n", il);
+
             // MLP (shared exp)
-            ggml_tensor * cur_mlp = build_norm(attn_out,
-                    model.layers[il].ffn_norm, nullptr,
-                    LLM_NORM_RMS, il);
+            ggml_tensor * cur_mlp = ggml_mul(ctx0, attn_out_n, model.layers[il].ffn_norm);
             cb(cur_mlp, "ffn_norm_1", il);
 
             cur_mlp = build_ffn(cur_mlp,
@@ -281,13 +285,11 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur_mlp, "ffn_mlp", il);
 
             // Expert FFN
-            ggml_tensor * cur_moe = build_norm(attn_out,
-                    model.layers[il].ffn_pre_norm_2, nullptr,
-                    LLM_NORM_RMS, il);
+            ggml_tensor * cur_moe = ggml_mul(ctx0, attn_out_n, model.layers[il].ffn_pre_norm_2);
             cb(cur_moe, "ffn_norm_2", il);
 
             // custom MoE logits calculation (router operates on attn_out, not cur)
-            ggml_tensor * tmp = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
+            ggml_tensor * tmp = attn_out_n;
             tmp = ggml_scale(ctx0, tmp, 1.0f / sqrtf((float) n_embd));
             tmp = ggml_mul(ctx0, tmp, model.layers[il].ffn_gate_inp_s);
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
