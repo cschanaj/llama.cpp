@@ -10820,13 +10820,19 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             ? state_work
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
-        // copy input state into the working buffer and operate in-place
-        // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
+        // input state: seq iv3 starts at iv3 * state_seq_stride, head iv1 at +iv1*S_v*S_v
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+
+        // Seed the working state s_out from s_in lazily on the first token's scale
+        // step below (fusing the seed copy with the scale), instead of a separate
+        // full memcpy before the loop. For a degenerate n_tokens == 0 batch the loop
+        // never runs, so seed explicitly to keep the output state defined.
+        if (n_tokens == 0) {
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         for (int64_t t = 0; t < n_tokens; t++) {
             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
@@ -10839,17 +10845,29 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             // state is stored transposed: s_out[j*S_v + i] = S[i][j]
             // so row j of s_out = column j of S (contiguous access)
 
+            // on the first token, read the input state s_in and write s_out (seed);
+            // afterwards operate in-place on s_out
+            const float * s_src = (t == 0) ? s_in : s_out;
+
             if (kda) {
                 // precompute exp(g) into delta scratch (reused below)
                 for (int64_t i = 0; i < S_v; ++i) {
                     delta[i] = expf(g_d[i]);
                 }
-                // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
+                // M[j][i] = s_src[j][i] * exp(g[i]); seeds s_out on t==0, scales in-place after
                 for (int64_t j = 0; j < S_v; ++j) {
-                    ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
+                    ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_src[j * S_v], delta);
                 }
             } else {
-                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
+                const float expg = expf(g_d[0]);
+                if (t == 0) {
+                    // seed + scale in one pass: s_out = s_in * expg
+                    for (int64_t i = 0; i < S_v * S_v; ++i) {
+                        s_out[i] = s_in[i] * expg;
+                    }
+                } else {
+                    ggml_vec_scale_f32(S_v * S_v, s_out, expg);
+                }
             }
 
             // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
