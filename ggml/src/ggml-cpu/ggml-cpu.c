@@ -3023,10 +3023,14 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
-static int ggml_cpu_try_fuse_ops(
+// Decide whether the node at node_n starts a fusable pair, WITHOUT executing it.
+// The decision depends only on graph topology and tensor metadata, so it is safe
+// to hoist to graph-plan time (it does not need the compute params). Returns the
+// number of EXTRA nodes consumed beyond node_n itself (0 = no fusion,
+// 1 = RMS_NORM+MUL, i.e. node_n and node_n+1 are merged).
+static int ggml_cpu_fuse_detect(
         const struct ggml_cgraph * cgraph,
         const int node_n,
-        const struct ggml_compute_params * params,
         const struct ggml_cplan * cplan) {
 
     if (ggml_cpu_disable_fusion || cplan->use_ref) {
@@ -3047,14 +3051,28 @@ static int ggml_cpu_try_fuse_ops(
                 mul_w->type         == GGML_TYPE_F32 &&
                 mul_w->ne[0]        == node->ne[0]   &&
                 mul_w->nb[0]        == sizeof(float)) {
-
-                ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
                 return 1;
             }
         }
     }
 
     return 0;
+}
+
+// Execute the fused kernel for a node whose fusion was decided by
+// ggml_cpu_fuse_detect. Runs the multi-threaded fused compute.
+static void ggml_cpu_fuse_exec(
+        const struct ggml_compute_params * params,
+        const struct ggml_cgraph * cgraph,
+        const int node_n,
+        const int fuse_type) {
+
+    if (fuse_type == 1) {
+        // RMS_NORM + MUL
+        struct ggml_tensor * node     = cgraph->nodes[node_n];
+        struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
+        ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
+    }
 }
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
@@ -3086,7 +3104,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     // per-op-type profiler (thread 0 only)
-    static int64_t prof_fuse = 0;
+    static int64_t prof_fuse_check  = 0;   // fusion detection (ggml_cpu_fuse_detect)
+    static int64_t prof_fuse_kernel = 0;   // fused-op kernel execution
     static int64_t prof_op_time[GGML_OP_COUNT] = {0};
     static int     prof_op_cnt [GGML_OP_COUNT] = {0};
     static int     prof_step = 0;
@@ -3109,14 +3128,26 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         int64_t t0 = state->ith == 0 ? ggml_time_us() : 0;
 
-        // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
-        // Try fused ops, fall back to normal compute
-        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+        // Fusion: detect (cheap, O(1) per node) then, if fusable, exec the fused
+        // kernel. Splitting the two lets us measure each independently and is the
+        // prerequisite for hoisting detection to graph-plan time.
+        const int fuse_type = ggml_cpu_fuse_detect(cgraph, node_n, cplan);
 
         if (state->ith == 0) {
             int64_t t1 = ggml_time_us();
-            prof_fuse += t1 - t0;
+            prof_fuse_check += t1 - t0;
             t0 = t1;
+        }
+
+        int n_fused = 0;
+        if (fuse_type > 0) {
+            ggml_cpu_fuse_exec(&params, cgraph, node_n, fuse_type);
+            n_fused = fuse_type;
+            if (state->ith == 0) {
+                int64_t t1 = ggml_time_us();
+                prof_fuse_kernel += t1 - t0;
+                t0 = t1;
+            }
         }
 
         if (n_fused > 0) {
@@ -3150,9 +3181,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     if (state->ith == 0) {
         prof_step++;
         if (prof_step % 16 == 0) {
-            int64_t total = prof_fuse;
+            int64_t total = prof_fuse_check + prof_fuse_kernel;
             for (int i = 0; i < GGML_OP_COUNT; i++) total += prof_op_time[i];
-            fprintf(stderr, "prof step %d: fusion=%lld us, total=%lld us\n", prof_step, (long long)prof_fuse, (long long)total);
+            fprintf(stderr, "prof step %d: fuse_check=%lld us fuse_kernel=%lld us, total=%lld us\n",
+                    prof_step, (long long)prof_fuse_check, (long long)prof_fuse_kernel, (long long)total);
             for (int i = 0; i < GGML_OP_COUNT; i++) {
                 if (prof_op_time[i] > 0) {
                     fprintf(stderr, "  op[%d] %-16s: %lld us (%d calls, %lld us/call) [ne0=%lld ne=%lld type=%s]\n",
@@ -3163,7 +3195,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                             ggml_type_name((enum ggml_type) prof_smp_type[i]));
                 }
             }
-            prof_fuse = 0;
+            prof_fuse_check  = 0;
+            prof_fuse_kernel = 0;
             memset(prof_op_time, 0, sizeof(prof_op_time));
             memset(prof_op_cnt,  0, sizeof(prof_op_cnt));
             memset(prof_smp_ne0,   0, sizeof(prof_smp_ne0));
