@@ -1257,23 +1257,34 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 extern void ggml_repack_q4_K(void * dst, const void * src, int64_t nblocks);
 extern void ggml_vec_dot_q4_K_q8_K_r(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
 
-static const void * g_q4k_r_orig = NULL;
-static void *       g_q4k_r_buf  = NULL;
+#define Q4K_R_CACHE_MAX 2048
+struct q4k_r_entry { const void * orig; void * repacked; };
+static struct q4k_r_entry g_q4k_r_cache[Q4K_R_CACHE_MAX];
+static int g_q4k_r_cache_n = 0;
 
-static void * ggml_cpu_q4k_r_get(const struct ggml_tensor * src0) {
-    if (src0->data == g_q4k_r_orig && g_q4k_r_buf) return g_q4k_r_buf;
-    const int64_t nb_row = src0->ne[0] / QK_K;   // blocks per row
+// Repack if not yet cached — called by ith==0 before the barrier.
+static void ggml_cpu_q4k_r_repack(const struct ggml_tensor * src0) {
+    for (int i = 0; i < g_q4k_r_cache_n; i++)
+        if (g_q4k_r_cache[i].orig == src0->data) return;
+    if (g_q4k_r_cache_n >= Q4K_R_CACHE_MAX) return;
+    const int64_t nb_row = src0->ne[0] / QK_K;
     const int64_t nrows  = ggml_nrows(src0);
-    void * buf = malloc(nrows * nb_row * Q4K_R_BLK);
-    for (int64_t r = 0; r < nrows; r++) {
-        ggml_repack_q4_K(
-            (uint8_t*)buf + r * nb_row * Q4K_R_BLK,
-            (const uint8_t*)src0->data + r * src0->nb[1],
-            nb_row);
-    }
-    g_q4k_r_orig = src0->data;
-    g_q4k_r_buf  = buf;
-    return buf;
+    const int64_t stride = nb_row * Q4K_R_BLK;
+    void * buf = malloc((size_t) nrows * (size_t) stride);
+    if (!buf) return;
+    for (int64_t r = 0; r < nrows; r++)
+        ggml_repack_q4_K((uint8_t*)buf + r*stride,
+                         (const uint8_t*)src0->data + r*src0->nb[1], nb_row);
+    g_q4k_r_cache[g_q4k_r_cache_n].orig     = src0->data;
+    g_q4k_r_cache[g_q4k_r_cache_n].repacked = buf;
+    g_q4k_r_cache_n++;
+}
+
+// Lookup cached repacked buffer — called by all threads after the barrier.
+static void * ggml_cpu_q4k_r_lookup(const void * orig) {
+    for (int i = 0; i < g_q4k_r_cache_n; i++)
+        if (g_q4k_r_cache[i].orig == orig) return g_q4k_r_cache[i].repacked;
+    return NULL;
 }
 
 void ggml_compute_forward_mul_mat(
@@ -1386,28 +1397,30 @@ UseGgmlGemm1:;
         atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
         // repack Q4_K weights once (cached), so all threads can use pre-unpacked scales
         if (src0->type == GGML_TYPE_Q4_K) {
-            ggml_cpu_q4k_r_get(src0);
+            ggml_cpu_q4k_r_repack(src0);
         }
     }
 
     ggml_barrier(params->threadpool);
 
     // === Q4_K repacked decode fast path (M=1 GEMV) ===
-    if (src0->type == GGML_TYPE_Q4_K && src1_cont && ne11 == 1 && g_q4k_r_buf) {
-        const void * vx_r = g_q4k_r_buf;
-        const int64_t nb_row   = ne00 / QK_K;
-        const int64_t row_stride_r = nb_row * Q4K_R_BLK;
-        const void * vy = (src1->type != vec_dot_type) ? params->wdata : src1->data;
-        const int64_t n_rows = ne01;
-        const int64_t dr = (n_rows + nth - 1) / nth;
-        const int64_t r0 = dr * ith;
-        const int64_t r1 = (r0 + dr < n_rows) ? (r0 + dr) : n_rows;
-        for (int64_t row = r0; row < r1; ++row) {
-            float * dst_row = (float*)((char*)dst->data + row*nb0);
-            ggml_vec_dot_q4_K_q8_K_r(ne00, dst_row, 0,
-                (const uint8_t*)vx_r + row*row_stride_r, 0, vy, 0, 1);
+    if (src0->type == GGML_TYPE_Q4_K && src1_cont && ne11 == 1) {
+        const void * vx_r = ggml_cpu_q4k_r_lookup(src0->data);
+        if (vx_r) {
+            const int64_t nb_row   = ne00 / QK_K;
+            const int64_t row_stride_r = nb_row * Q4K_R_BLK;
+            const void * vy = (src1->type != vec_dot_type) ? params->wdata : src1->data;
+            const int64_t n_rows = ne01;
+            const int64_t dr = (n_rows + nth - 1) / nth;
+            const int64_t r0 = dr * ith;
+            const int64_t r1 = (r0 + dr < n_rows) ? (r0 + dr) : n_rows;
+            for (int64_t row = r0; row < r1; ++row) {
+                float * dst_row = (float*)((char*)dst->data + row*nb0);
+                ggml_vec_dot_q4_K_q8_K_r(ne00, dst_row, 0,
+                    (const uint8_t*)vx_r + row*row_stride_r, 0, vy, 0, 1);
+            }
+            return;
         }
-        return;
     }
 
 #if GGML_USE_LLAMAFILE
