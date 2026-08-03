@@ -3085,6 +3085,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    // per-op-type profiler (thread 0 only)
+    static int64_t prof_fuse = 0;
+    static int64_t prof_op_time[GGML_OP_COUNT] = {0};
+    static int     prof_op_cnt [GGML_OP_COUNT] = {0};
+    static int     prof_step = 0;
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3097,13 +3103,28 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        int64_t t0 = state->ith == 0 ? ggml_time_us() : 0;
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+
+        if (state->ith == 0) {
+            int64_t t1 = ggml_time_us();
+            prof_fuse += t1 - t0;
+            t0 = t1;
+        }
+
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (state->ith == 0) {
+            int64_t dt = ggml_time_us() - t0;
+            prof_op_time[node->op] += dt;
+            prof_op_cnt [node->op] += 1;
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3114,6 +3135,25 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+    }
+
+    if (state->ith == 0) {
+        prof_step++;
+        if (prof_step % 16 == 0) {
+            int64_t total = prof_fuse;
+            for (int i = 0; i < GGML_OP_COUNT; i++) total += prof_op_time[i];
+            fprintf(stderr, "prof step %d: fusion=%lld us, total=%lld us\n", prof_step, (long long)prof_fuse, (long long)total);
+            for (int i = 0; i < GGML_OP_COUNT; i++) {
+                if (prof_op_time[i] > 0) {
+                    fprintf(stderr, "  op[%d]: %lld us (%d calls, %lld us/call)\n",
+                            i, (long long)prof_op_time[i], prof_op_cnt[i],
+                            (long long)(prof_op_cnt[i] > 0 ? prof_op_time[i] / prof_op_cnt[i] : 0));
+                }
+            }
+            prof_fuse = 0;
+            memset(prof_op_time, 0, sizeof(prof_op_time));
+            memset(prof_op_cnt,  0, sizeof(prof_op_cnt));
         }
     }
 
