@@ -1454,28 +1454,28 @@ inline static void ggml_vec_reglu_f16 (const int n, ggml_fp16_t * y, const ggml_
 
 #ifdef GGML_GELU_FP16
 inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
-    int i = 0;
+    // Three mutually-exclusive paths. The vectorized tanh-GELU (built on
+    // ggml_v_expf) is strictly more accurate than the fp16 lookup table used as
+    // the AVX2 remainder tail and as the full fallback on arches without AVX.
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
-    // vectorized tanh-GELU gate*up; strictly more accurate than the fp16 table below
+    int i = 0;
     for (; i + 15 < n; i += 16) {
         _mm512_storeu_ps(y + i, _mm512_mul_ps(ggml_v_gelu(_mm512_loadu_ps(x + i)), _mm512_loadu_ps(g + i)));
     }
-    // remainder (n - i in [1,15]): one masked block, no scalar tail. The masked
-    // loads do not fault on the masked-out lanes, so reading past the array end
-    // (within this 16-element block) is safe.
+    // final partial block via masking; masked loads do not fault on masked-out
+    // lanes, so reading past the array end within this 16-element block is safe.
     if (i < n) {
         const __mmask16 mask = (__mmask16)((1u << (n - i)) - 1);
         const __m512 vx = _mm512_maskz_loadu_ps(mask, x + i);
         const __m512 vg = _mm512_maskz_loadu_ps(mask, g + i);
         _mm512_mask_storeu_ps(y + i, mask, _mm512_mul_ps(ggml_v_gelu(vx), vg));
-        i = n;
     }
 #elif defined(__AVX2__) && defined(__FMA__)
-    // vectorized tanh-GELU gate*up; strictly more accurate than the fp16 table below
+    int i = 0;
     for (; i + 7 < n; i += 8) {
         _mm256_storeu_ps(y + i, _mm256_mul_ps(ggml_v_gelu(_mm256_loadu_ps(x + i)), _mm256_loadu_ps(g + i)));
     }
-#endif
+    // scalar fp16-table tail for the (< 8) remaining elements
     uint16_t t;
     for (; i < n; ++i) {
         if (x[i] <= -10.0f) {
@@ -1488,6 +1488,21 @@ inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, c
             y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]) * g[i];
         }
     }
+#else
+    // arches without a vectorized GEGLU: scalar fp16-table for the whole range
+    uint16_t t;
+    for (int i = 0; i < n; ++i) {
+        if (x[i] <= -10.0f) {
+            y[i] = 0.0f;
+        } else if (x[i] >= 10.0f) {
+            y[i] = x[i] * g[i];
+        } else {
+            ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(x[i]);
+            memcpy(&t, &fp16, sizeof(uint16_t));
+            y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]) * g[i];
+        }
+    }
+#endif
 }
 #else
 inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
