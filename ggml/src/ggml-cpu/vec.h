@@ -906,7 +906,7 @@ inline static void ggml_vec_step_f16 (const int n, ggml_fp16_t * y, const ggml_f
         y[i] = GGML_CPU_FP32_TO_FP16((GGML_CPU_FP16_TO_FP32(x[i]) > 0.f) ? 1.f : 0.f);
     }
 }
-inline static void ggml_vec_tanh_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = tanhf(x[i]);  }
+void ggml_vec_tanh_f32(const int n, float * y, const float * x);
 inline static void ggml_vec_tanh_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(tanhf(GGML_CPU_FP16_TO_FP32(x[i])));
@@ -1206,24 +1206,28 @@ inline static __m512 ggml_v_silu(__m512 x) {
     return _mm512_div_ps(x, one_plus_exp_neg_x);
 }
 
-// computes the tanh GELU 0.5*x*(1+tanh(sqrt(2/pi)*x*(1+0.044715*x^2))) in single
-// precision vector. The tanh argument is clamped to [-9,9]: tanh saturates to
-// +/-1 there (in f32) so this costs no precision, and it keeps exp(2*inner)
-// finite so the computation is NaN-free across the whole f32 input range.
+// computes tanh as 1 - 2/(exp(2x)+1) in single precision vector (clamped to
+// [-9,9] -- see the __m256 version). Shared by ggml_v_gelu and ggml_vec_tanh_f32.
+inline static __m512 ggml_v_tanh(__m512 x) {
+    const __m512 one   = _mm512_set1_ps(1.0f);
+    const __m512 two   = _mm512_set1_ps(2.0f);
+    const __m512 ncl   = _mm512_set1_ps(-9.0f);
+    const __m512 pcl   = _mm512_set1_ps(9.0f);
+    const __m512 xc    = _mm512_min_ps(_mm512_max_ps(x, ncl), pcl);
+    const __m512 e2    = ggml_v_expf(_mm512_mul_ps(two, xc));                 // exp(2x)
+    return _mm512_sub_ps(one, _mm512_div_ps(two, _mm512_add_ps(e2, one)));    // 1 - 2/(exp(2x)+1)
+}
+
+// computes the tanh GELU 0.5*x*(1+tanh(sqrt(2/pi)*x*(1+0.044715*x^2)))
 inline static __m512 ggml_v_gelu(__m512 x) {
     const __m512 c     = _mm512_set1_ps(0.7978845608028654f); // SQRT_2_OVER_PI
     const __m512 a     = _mm512_set1_ps(0.044715f);           // GELU_COEF_A
     const __m512 one   = _mm512_set1_ps(1.0f);
     const __m512 half  = _mm512_set1_ps(0.5f);
-    const __m512 two   = _mm512_set1_ps(2.0f);
-    const __m512 ncl   = _mm512_set1_ps(-9.0f);
-    const __m512 pcl   = _mm512_set1_ps(9.0f);
     const __m512 x2    = _mm512_mul_ps(x, x);
     const __m512 poly  = _mm512_fmadd_ps(a, x2, one);              // 1 + a*x^2
     const __m512 inner = _mm512_mul_ps(x, _mm512_mul_ps(c, poly)); // sqrt(2/pi)*x*(1+a*x^2)
-    const __m512 innc  = _mm512_min_ps(_mm512_max_ps(inner, ncl), pcl);
-    const __m512 e2    = ggml_v_expf(_mm512_mul_ps(two, innc));    // exp(2*inner)
-    const __m512 t     = _mm512_sub_ps(one, _mm512_div_ps(two, _mm512_add_ps(e2, one))); // 1 - 2/(exp(2*inner)+1)
+    const __m512 t     = ggml_v_tanh(inner);
     return _mm512_mul_ps(half, _mm512_mul_ps(x, _mm512_add_ps(one, t)));
 }
 
@@ -1282,23 +1286,29 @@ inline static __m256 ggml_v_silu(__m256 x) {
     return _mm256_div_ps(x, one_plus_exp_neg_x);
 }
 
-// computes the tanh GELU 0.5*x*(1+tanh(sqrt(2/pi)*x*(1+0.044715*x^2))) in single
-// precision vector. The tanh argument is clamped to [-9,9]: tanh saturates to
-// +/-1 there (in f32) so this costs no precision, and it keeps exp(2*inner)
-// finite so the computation is NaN-free across the whole f32 input range.
+// computes tanh as 1 - 2/(exp(2x)+1) in single precision vector. The argument is
+// clamped to [-9,9]: tanh saturates to +/-1 there (in f32) so this costs no
+// precision, and it keeps exp(2x) finite so the computation is NaN-free across
+// the whole f32 input range. Shared by ggml_v_gelu and ggml_vec_tanh_f32.
+inline static __m256 ggml_v_tanh(__m256 x) {
+    const __m256 one   = _mm256_set1_ps(1.0f);
+    const __m256 two   = _mm256_set1_ps(2.0f);
+    const __m256 clamp = _mm256_set1_ps(9.0f);
+    const __m256 xc    = _mm256_min_ps(_mm256_max_ps(x, _mm256_sub_ps(_mm256_setzero_ps(), clamp)), clamp);
+    const __m256 e2    = ggml_v_expf(_mm256_mul_ps(two, xc));                 // exp(2x)
+    return _mm256_sub_ps(one, _mm256_div_ps(two, _mm256_add_ps(e2, one)));    // 1 - 2/(exp(2x)+1)
+}
+
+// computes the tanh GELU 0.5*x*(1+tanh(sqrt(2/pi)*x*(1+0.044715*x^2)))
 inline static __m256 ggml_v_gelu(__m256 x) {
     const __m256 c     = _mm256_set1_ps(0.7978845608028654f); // SQRT_2_OVER_PI
     const __m256 a     = _mm256_set1_ps(0.044715f);           // GELU_COEF_A
     const __m256 one   = _mm256_set1_ps(1.0f);
     const __m256 half  = _mm256_set1_ps(0.5f);
-    const __m256 two   = _mm256_set1_ps(2.0f);
-    const __m256 clamp = _mm256_set1_ps(9.0f);
     const __m256 x2    = _mm256_mul_ps(x, x);
     const __m256 poly  = _mm256_fmadd_ps(a, x2, one);              // 1 + a*x^2
     const __m256 inner = _mm256_mul_ps(x, _mm256_mul_ps(c, poly)); // sqrt(2/pi)*x*(1+a*x^2)
-    const __m256 innc  = _mm256_min_ps(_mm256_max_ps(inner, _mm256_sub_ps(_mm256_setzero_ps(), clamp)), clamp);
-    const __m256 e2    = ggml_v_expf(_mm256_mul_ps(two, innc));    // exp(2*inner)
-    const __m256 t     = _mm256_sub_ps(one, _mm256_div_ps(two, _mm256_add_ps(e2, one))); // 1 - 2/(exp(2*inner)+1)
+    const __m256 t     = ggml_v_tanh(inner);
     return _mm256_mul_ps(half, _mm256_mul_ps(x, _mm256_add_ps(one, t)));
 }
 

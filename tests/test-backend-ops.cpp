@@ -10092,6 +10092,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // tanh (e.g. Gemma final-logit softcapping) at vocab-ish sizes; decode + prefill
+    for (int n : { 32000, 128256, 262144 }) {
+        test_cases.emplace_back(new test_unary(GGML_UNARY_OP_TANH, GGML_TYPE_F32, { n, 1,   1, 1 }, 0));
+        test_cases.emplace_back(new test_unary(GGML_UNARY_OP_TANH, GGML_TYPE_F32, { n, 128, 1, 1 }, 0));
+    }
+
     return test_cases;
 }
 

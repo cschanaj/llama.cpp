@@ -452,6 +452,35 @@ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * 
     }
 }
 
+void ggml_vec_tanh_f32(const int n, float * y, const float * x) {
+    // Three mutually-exclusive paths; vectorized via ggml_v_tanh (same shape as
+    // ggml_vec_geglu_f32). Scalar tanhf is the AVX2 remainder tail and the full
+    // path on arches without AVX.
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, ggml_v_tanh(_mm512_loadu_ps(x + i)));
+    }
+    // final partial block via masking; masked loads do not fault on masked-out lanes
+    if (i < n) {
+        const __mmask16 mask = (__mmask16)((1u << (n - i)) - 1);
+        _mm512_mask_storeu_ps(y + i, mask, ggml_v_tanh(_mm512_maskz_loadu_ps(mask, x + i)));
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, ggml_v_tanh(_mm256_loadu_ps(x + i)));
+    }
+    for (; i < n; ++i) {
+        y[i] = tanhf(x[i]);
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        y[i] = tanhf(x[i]);
+    }
+#endif
+}
+
 ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean) {
     int i = 0;
     ggml_float sum = 0;

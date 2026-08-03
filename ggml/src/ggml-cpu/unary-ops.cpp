@@ -1,4 +1,5 @@
 #include "unary-ops.h"
+#include "vec.h" // ggml_vec_tanh_f32 (vectorized tanh fast path)
 
 static inline float op_abs(float x) {
     return fabsf(x);
@@ -105,6 +106,15 @@ static inline void vec_unary_op(int64_t n, dst_t * y, const src0_t * x) {
     for (int i = 0; i < n; i++) {
         y[i] = f32_to_dst(op(src0_to_f32(x[i])));
     }
+}
+
+// f32 tanh fast path: use the vectorized ggml_vec_tanh_f32 (built on ggml_v_tanh)
+// instead of the scalar per-element op_tanh. f16/bf16 still use the generic
+// template above. This is what the UNARY tanh op (e.g. Gemma final-logit
+// softcapping) goes through.
+template <>
+inline void vec_unary_op<op_tanh, float, float>(int64_t n, float * y, const float * x) {
+    ggml_vec_tanh_f32((int) n, y, x);
 }
 
 template <float (*op)(float), typename src0_t, typename dst_t>
