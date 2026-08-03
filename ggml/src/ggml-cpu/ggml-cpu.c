@@ -3090,6 +3090,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     static int64_t prof_op_time[GGML_OP_COUNT] = {0};
     static int     prof_op_cnt [GGML_OP_COUNT] = {0};
     static int     prof_step = 0;
+    // one sample tensor shape per op-type (first occurrence) so op identity is unambiguous
+    static int64_t prof_smp_ne0[GGML_OP_COUNT]   = {0};
+    static int64_t prof_smp_elems[GGML_OP_COUNT] = {0};
+    static int     prof_smp_type[GGML_OP_COUNT]  = {0};
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3125,6 +3129,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             int64_t dt = ggml_time_us() - t0;
             prof_op_time[node->op] += dt;
             prof_op_cnt [node->op] += 1;
+            if (prof_op_cnt[node->op] == 1) {
+                prof_smp_ne0[node->op]   = node->ne[0];
+                prof_smp_elems[node->op] = ggml_nelements(node);
+                prof_smp_type[node->op]  = (int) node->type;
+            }
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3146,14 +3155,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             fprintf(stderr, "prof step %d: fusion=%lld us, total=%lld us\n", prof_step, (long long)prof_fuse, (long long)total);
             for (int i = 0; i < GGML_OP_COUNT; i++) {
                 if (prof_op_time[i] > 0) {
-                    fprintf(stderr, "  op[%d]: %lld us (%d calls, %lld us/call)\n",
-                            i, (long long)prof_op_time[i], prof_op_cnt[i],
-                            (long long)(prof_op_cnt[i] > 0 ? prof_op_time[i] / prof_op_cnt[i] : 0));
+                    fprintf(stderr, "  op[%d] %-16s: %lld us (%d calls, %lld us/call) [ne0=%lld ne=%lld type=%s]\n",
+                            i, ggml_op_name((enum ggml_op) i),
+                            (long long)prof_op_time[i], prof_op_cnt[i],
+                            (long long)(prof_op_cnt[i] > 0 ? prof_op_time[i] / prof_op_cnt[i] : 0),
+                            (long long)prof_smp_ne0[i], (long long)prof_smp_elems[i],
+                            ggml_type_name((enum ggml_type) prof_smp_type[i]));
                 }
             }
             prof_fuse = 0;
             memset(prof_op_time, 0, sizeof(prof_op_time));
             memset(prof_op_cnt,  0, sizeof(prof_op_cnt));
+            memset(prof_smp_ne0,   0, sizeof(prof_smp_ne0));
+            memset(prof_smp_elems, 0, sizeof(prof_smp_elems));
+            memset(prof_smp_type,  0, sizeof(prof_smp_type));
         }
     }
 
