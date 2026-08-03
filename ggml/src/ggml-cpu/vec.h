@@ -1206,6 +1206,27 @@ inline static __m512 ggml_v_silu(__m512 x) {
     return _mm512_div_ps(x, one_plus_exp_neg_x);
 }
 
+// computes the tanh GELU 0.5*x*(1+tanh(sqrt(2/pi)*x*(1+0.044715*x^2))) in single
+// precision vector. The tanh argument is clamped to [-9,9]: tanh saturates to
+// +/-1 there (in f32) so this costs no precision, and it keeps exp(2*inner)
+// finite so the computation is NaN-free across the whole f32 input range.
+inline static __m512 ggml_v_gelu(__m512 x) {
+    const __m512 c     = _mm512_set1_ps(0.7978845608028654f); // SQRT_2_OVER_PI
+    const __m512 a     = _mm512_set1_ps(0.044715f);           // GELU_COEF_A
+    const __m512 one   = _mm512_set1_ps(1.0f);
+    const __m512 half  = _mm512_set1_ps(0.5f);
+    const __m512 two   = _mm512_set1_ps(2.0f);
+    const __m512 ncl   = _mm512_set1_ps(-9.0f);
+    const __m512 pcl   = _mm512_set1_ps(9.0f);
+    const __m512 x2    = _mm512_mul_ps(x, x);
+    const __m512 poly  = _mm512_fmadd_ps(a, x2, one);              // 1 + a*x^2
+    const __m512 inner = _mm512_mul_ps(x, _mm512_mul_ps(c, poly)); // sqrt(2/pi)*x*(1+a*x^2)
+    const __m512 innc  = _mm512_min_ps(_mm512_max_ps(inner, ncl), pcl);
+    const __m512 e2    = ggml_v_expf(_mm512_mul_ps(two, innc));    // exp(2*inner)
+    const __m512 t     = _mm512_sub_ps(one, _mm512_div_ps(two, _mm512_add_ps(e2, one))); // 1 - 2/(exp(2*inner)+1)
+    return _mm512_mul_ps(half, _mm512_mul_ps(x, _mm512_add_ps(one, t)));
+}
+
 #elif defined(__AVX2__) && defined(__FMA__)
 
 // adapted from arm limited optimized routine
@@ -1434,7 +1455,22 @@ inline static void ggml_vec_reglu_f16 (const int n, ggml_fp16_t * y, const ggml_
 #ifdef GGML_GELU_FP16
 inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
     int i = 0;
-#if defined(__AVX2__) && defined(__FMA__)
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    // vectorized tanh-GELU gate*up; strictly more accurate than the fp16 table below
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, _mm512_mul_ps(ggml_v_gelu(_mm512_loadu_ps(x + i)), _mm512_loadu_ps(g + i)));
+    }
+    // remainder (n - i in [1,15]): one masked block, no scalar tail. The masked
+    // loads do not fault on the masked-out lanes, so reading past the array end
+    // (within this 16-element block) is safe.
+    if (i < n) {
+        const __mmask16 mask = (__mmask16)((1u << (n - i)) - 1);
+        const __m512 vx = _mm512_maskz_loadu_ps(mask, x + i);
+        const __m512 vg = _mm512_maskz_loadu_ps(mask, g + i);
+        _mm512_mask_storeu_ps(y + i, mask, _mm512_mul_ps(ggml_v_gelu(vx), vg));
+        i = n;
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
     // vectorized tanh-GELU gate*up; strictly more accurate than the fp16 table below
     for (; i + 7 < n; i += 8) {
         _mm256_storeu_ps(y + i, _mm256_mul_ps(ggml_v_gelu(_mm256_loadu_ps(x + i)), _mm256_loadu_ps(g + i)));
