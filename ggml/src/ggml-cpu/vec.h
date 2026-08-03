@@ -1261,6 +1261,26 @@ inline static __m256 ggml_v_silu(__m256 x) {
     return _mm256_div_ps(x, one_plus_exp_neg_x);
 }
 
+// computes the tanh GELU 0.5*x*(1+tanh(sqrt(2/pi)*x*(1+0.044715*x^2))) in single
+// precision vector. The tanh argument is clamped to [-9,9]: tanh saturates to
+// +/-1 there (in f32) so this costs no precision, and it keeps exp(2*inner)
+// finite so the computation is NaN-free across the whole f32 input range.
+inline static __m256 ggml_v_gelu(__m256 x) {
+    const __m256 c     = _mm256_set1_ps(0.7978845608028654f); // SQRT_2_OVER_PI
+    const __m256 a     = _mm256_set1_ps(0.044715f);           // GELU_COEF_A
+    const __m256 one   = _mm256_set1_ps(1.0f);
+    const __m256 half  = _mm256_set1_ps(0.5f);
+    const __m256 two   = _mm256_set1_ps(2.0f);
+    const __m256 clamp = _mm256_set1_ps(9.0f);
+    const __m256 x2    = _mm256_mul_ps(x, x);
+    const __m256 poly  = _mm256_fmadd_ps(a, x2, one);              // 1 + a*x^2
+    const __m256 inner = _mm256_mul_ps(x, _mm256_mul_ps(c, poly)); // sqrt(2/pi)*x*(1+a*x^2)
+    const __m256 innc  = _mm256_min_ps(_mm256_max_ps(inner, _mm256_sub_ps(_mm256_setzero_ps(), clamp)), clamp);
+    const __m256 e2    = ggml_v_expf(_mm256_mul_ps(two, innc));    // exp(2*inner)
+    const __m256 t     = _mm256_sub_ps(one, _mm256_div_ps(two, _mm256_add_ps(e2, one))); // 1 - 2/(exp(2*inner)+1)
+    return _mm256_mul_ps(half, _mm256_mul_ps(x, _mm256_add_ps(one, t)));
+}
+
 #elif defined(__SSE2__) // __AVX2__ / __ARM_NEON
 
 #if defined(__FMA__)
@@ -1413,8 +1433,15 @@ inline static void ggml_vec_reglu_f16 (const int n, ggml_fp16_t * y, const ggml_
 
 #ifdef GGML_GELU_FP16
 inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
+    int i = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+    // vectorized tanh-GELU gate*up; strictly more accurate than the fp16 table below
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(ggml_v_gelu(_mm256_loadu_ps(x + i)), _mm256_loadu_ps(g + i)));
+    }
+#endif
     uint16_t t;
-    for (int i = 0; i < n; ++i) {
+    for (; i < n; ++i) {
         if (x[i] <= -10.0f) {
             y[i] = 0.0f;
         } else if (x[i] >= 10.0f) {
