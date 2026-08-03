@@ -10081,6 +10081,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // GLU (gated FFN activation). GEGLU and SWIGLU are listed side by side at
+    // representative FFN-intermediate sizes for both decode (1 token) and prefill
+    // (batch), so the two gated variants -- both of which are now vectorized --
+    // can be compared and regressions caught.
+    for (ggml_glu_op op : { GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU }) {
+        for (int n_ff : { 11008, 14336, 29568 }) {
+            test_cases.emplace_back(new test_glu_split(op, GGML_TYPE_F32, { n_ff, 1,   1, 1 }, 0)); // decode
+            test_cases.emplace_back(new test_glu_split(op, GGML_TYPE_F32, { n_ff, 128, 1, 1 }, 0)); // prefill
+        }
+    }
+
     return test_cases;
 }
 
