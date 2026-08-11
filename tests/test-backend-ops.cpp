@@ -6343,6 +6343,35 @@ struct test_sum_rows : public test_case {
     }
 };
 
+// GGML_OP_WEIGHTED_SUM
+struct test_weighted_sum : public test_case {
+    const int64_t n; // rows     (n_embd)
+    const int64_t k; // experts  (n_expert_used)
+    const int64_t m; // columns  (n_tokens)
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, k, m);
+    }
+
+    test_weighted_sum(int64_t n = 64, int64_t k = 8, int64_t m = 32)
+        : n(n), k(k), m(m) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, k, m);
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, k, m);
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_weighted_sum(ctx, a, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_MEAN
 struct test_mean : public test_case {
     const ggml_type type;
@@ -9411,6 +9440,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 33, 1, 1, 1 }));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 33, 1024, 1, 1 }));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 33, 256, 1, 1 }));
+
+    test_cases.emplace_back(new test_weighted_sum(64, 8, 32));
+    test_cases.emplace_back(new test_weighted_sum(17, 3, 13));   // odd sizes
+    test_cases.emplace_back(new test_weighted_sum(128, 4, 1));   // decode-like (m == 1)
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {64, 64, 320, 1}));
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {9, 9, 1280, 1}));
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 1}));

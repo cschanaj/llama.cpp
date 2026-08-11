@@ -1508,6 +1508,62 @@ void ggml_compute_forward_sum_rows(
     }
 }
 
+// ggml_compute_forward_weighted_sum
+
+static void ggml_compute_forward_weighted_sum_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0]; // a: [n, k, m]
+    const ggml_tensor * src1 = dst->src[1]; // b: [1, k, m] (broadcast over n)
+
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT( dst->nb[0] == sizeof(float));
+
+    const int64_t n = src0->ne[0];
+    const int64_t k = src0->ne[1];
+    const int64_t m = src0->ne[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // each thread owns a disjoint set of m (token) columns; within a column it
+    // streams the k experts once, doing dst[:,t] += w * a[:,k,t]. The K-wide
+    // scaled tensor of the broadcast-mul + add-chain is never materialized.
+    for (int64_t im = ith; im < m; im += nth) {
+        float       * GGML_RESTRICT d_col = (float       *)((char *) dst->data  + im*dst->nb[1]);
+        const char  * a_base = (const char *) src0->data + im*src0->nb[2];
+        const char  * b_base = (const char *) src1->data + im*src1->nb[2];
+
+        ggml_vec_set_f32(n, d_col, 0.0f);
+
+        for (int64_t ik = 0; ik < k; ++ik) {
+            const float   w     = *((const float *) (b_base + ik*src1->nb[1]));
+            const float * a_col = (const float *) (a_base + ik*src0->nb[1]);
+            ggml_vec_mad_f32(n, d_col, a_col, w);
+        }
+    }
+}
+
+void ggml_compute_forward_weighted_sum(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_weighted_sum_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_mean
 
 static void ggml_compute_forward_mean_f32(

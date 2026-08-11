@@ -1781,6 +1781,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_sum_rows(params, tensor);
             } break;
+        case GGML_OP_WEIGHTED_SUM:
+            {
+                ggml_compute_forward_weighted_sum(params, tensor);
+            } break;
         case GGML_OP_CUMSUM:
             {
                 ggml_compute_forward_cumsum(params, tensor);
@@ -2237,6 +2241,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_FILL:
+        case GGML_OP_WEIGHTED_SUM:
             {
                 n_tasks = n_threads;
             } break;

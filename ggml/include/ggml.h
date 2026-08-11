@@ -496,6 +496,7 @@ extern "C" {
         GGML_OP_COS,
         GGML_OP_SUM,
         GGML_OP_SUM_ROWS,
+        GGML_OP_WEIGHTED_SUM, // dst[i,t] = sum_k a[i,k,t] * b[0,k,t]  (a:[n,k,m], b:[1,k,m] -> dst:[n,m])
         GGML_OP_CUMSUM,
         GGML_OP_MEAN,
         GGML_OP_ARGMAX,
@@ -1047,6 +1048,13 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_sum_rows(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // weighted sum over the k axis: a:[n,k,m], b:[1,k,m] (broadcast over n) -> dst:[n,m]
+    // dst[i,t] = sum_k a[i,k,t] * b[0,k,t]
+    GGML_API struct ggml_tensor * ggml_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     GGML_API struct ggml_tensor * ggml_cumsum(
         struct ggml_context * ctx,

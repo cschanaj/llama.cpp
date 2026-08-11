@@ -1005,6 +1005,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "COS",
     "SUM",
     "SUM_ROWS",
+    "WEIGHTED_SUM",
     "CUMSUM",
     "MEAN",
     "ARGMAX",
@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1215,7 +1216,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2498,6 +2499,26 @@ struct ggml_tensor * ggml_sum_rows(
 
     result->op     = GGML_OP_SUM_ROWS;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_weighted_sum
+
+struct ggml_tensor * ggml_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->ne[1] == b->ne[1]);
+    GGML_ASSERT(a->ne[2] == b->ne[2]);
+    GGML_ASSERT(b->ne[0] == 1); // b broadcasts over a's ne[0]
+
+    int64_t ne[GGML_MAX_DIMS] = { a->ne[0], a->ne[2], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
+
+    result->op     = GGML_OP_WEIGHTED_SUM;
+    result->src[0] = a;
+    result->src[1] = b;
 
     return result;
 }
